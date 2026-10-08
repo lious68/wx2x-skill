@@ -1,0 +1,10 @@
+@echo off
+rem wx2x 计划任务入口示例。复制为 run.bat 后按需修改路径。
+rem schtasks /Create /TN wx2x /TR "cmd /c cd /d D:\wx2x && run.bat" /SC HOURLY /MO 3 /ST 08:00
+cd /d %~dp0
+
+rem 保洁：杀掉卡住的 node（>25 分钟）、清理残留锁（>20 分钟）
+rem powershell -NoProfile -File cleanup.ps1
+
+node scripts\wx2x.js run >> reports\wx2x_boot.log 2>&1
+echo exit code %errorlevel% >> reports\wx2x_boot.log
