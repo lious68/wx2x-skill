@@ -304,6 +304,9 @@ async function downloadImages(urls) {
 // 短段落 + 空行 + 编号 + 少量 emoji，图片重传，原文链接放最后一条。
 const THREAD_MAX_POSTS = 12;   // 一条推文串最多几条（含首条）
 const TWEET_SOFT_MAX = 240;    // 单条目标字数（中文按字符）
+// 能装进一条长推就发一条，别硬拆成串（2026-10-10 用户要求）。
+// X Premium 单条上限 25000「加权」字符，中文每字按 2 加权，所以 4000 中文字 ≈ 8000 加权，安全。
+const SINGLE_POST_MAX = Number(process.env.WX2X_SINGLE_MAX || 4000);
 const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
 const BOILER_RE = [
   /点击上方.{0,6}(关注|蓝字)/, /点击.{0,4}(卡片|链接|图片)/, /长按.{0,6}(识别|关注)/,
@@ -450,6 +453,19 @@ function buildThread({ title, body, url, images = [], boldSet = null }) {
   const t = stripMd(title).replace(/\s+/g, ' ').trim();
   const emoji = pickEmoji(t, clean);
   const isHead = (p) => isHeading(p) || (boldSet ? boldSet.has(p.trim()) : false);
+  // 先看能不能一条装下：能就发单条长推（标题 + 正文），不拆串
+  const singleText = ((emoji ? emoji + ' ' : '') + t + '\n\n' + clean).trim();
+  if (singleText.length <= SINGLE_POST_MAX) {
+    return {
+      posts: [{ text: singleText, images: images.slice(0, MAX_IMAGES) }],
+      emoji,
+      single: true,
+      truncated: false,
+      paragraphs: paras.length,
+      paras,
+      linkReply: `原文：${url}`,
+    };
+  }
   const chunks = chunkParagraphs(paras, TWEET_SOFT_MAX, isHead);
   const room = THREAD_MAX_POSTS - 1;
   const truncated = chunks.length > room;
@@ -959,7 +975,26 @@ async function replyToPost(ctx, targetUrl, text, { tailOf = false, dryRun = fals
     const toastCount = await page.locator('[data-testid="toast"]').count();
     const toast = toastCount ? (await page.locator('[data-testid="toast"]').first().innerText()).slice(0, 120) : '';
     const ok = dialogLeft === 0 && !/went wrong|出错|失败|错误|稍后/i.test(toast);
-    return { ok, target, toast, note: ok ? 'link reply posted' : `回复未确认 dialog=${dialogLeft} toast=${toast}` };
+    // 抓回复帖自己的 URL：target 是「被回复的帖子」，直接记 target 会把台账记错（2026-10-10 修正）
+    let replyUrl = null;
+    if (ok) {
+      const marker = text.replace(/\s+/g, '').slice(0, 24);
+      for (let i = 0; i < 6 && !replyUrl; i++) {
+        replyUrl = await page.evaluate((mk) => {
+          const arts = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+          for (const a of arts) {
+            const t = (a.innerText || '').replace(/\s+/g, '');
+            if (!mk || !t.includes(mk)) continue;
+            const link = a.querySelector('a[href*="/status/"] time')?.closest('a')?.href || '';
+            const id = (link.split('/status/')[1] || '').split(/[?/]/)[0];
+            if (/^\d+$/.test(id)) return link;
+          }
+          return null;
+        }, marker).catch(() => null);
+        if (!replyUrl) { await page.mouse.wheel(0, 1400); await page.waitForTimeout(2000); }
+      }
+    }
+    return { ok, target, replyUrl, toast, note: ok ? 'link reply posted' : `回复未确认 dialog=${dialogLeft} toast=${toast}` };
   } catch (e) {
     return { ok: false, target: targetUrl, note: 'error: ' + e.message.split('\n')[0].slice(0, 160) };
   } finally {
@@ -1007,7 +1042,7 @@ async function postOne(ctx, art, state) {
   const thread = built.posts;
   const totalChars = thread.reduce((a, p) => a + p.text.length, 0);
   // 长文（推文串装不下，会被截断）改走 X Articles：富文本、不截断
-  const mode = built.truncated ? 'article' : 'thread';
+  const mode = built.single ? 'single' : (built.truncated ? 'article' : 'thread');
   if (mode === 'article' && fs.existsSync(ART_ALERT)) {
     log({ action: 'post_result', title, ok: false, skipped: 'article_alert' });
     return { ok: false, skipped: 'article_alert', title, note: '上一次 Articles 发布未成功，已暂停长文搬运，等人工收尾（' + ART_ALERT + '）' };
@@ -1041,8 +1076,8 @@ async function postOne(ctx, art, state) {
     // 原文链接走自回复（整串零外链，避免 X 的外链降权）
     let linkReplyUrl = null;
     if (tweetUrl && art.url) {
-      const rr = await replyToPost(ctx, tweetUrl, built.linkReply, { tailOf: mode === 'thread' });
-      linkReplyUrl = rr.ok ? rr.target : null;
+      const rr = await replyToPost(ctx, tweetUrl, built.linkReply, { tailOf: built.posts.length > 1 });
+      linkReplyUrl = rr.ok ? (rr.replyUrl || rr.target) : null;
       log({ action: 'link_reply', title, ok: rr.ok, mode, target: linkReplyUrl, note: rr.note || '' });
       if (!rr.ok) console.error('link reply failed:', rr.note);
     }
@@ -1288,14 +1323,14 @@ async function cmdPreview(query, opts = {}) {
     const title = hit.title || art2.title;
     const imgs = art2.imgs || [];
     const built = buildThread({ title, body: art2.body || '', url: hit.url, images: imgs.map((_, i) => 'placeholder' + i), boldSet: new Set(art2.bolds || []) });
-    const mode = built.truncated ? 'article' : 'thread';
+    const mode = built.single ? 'single' : (built.truncated ? 'article' : 'thread');
     // --dry-article：把正文真的填进 Articles 编辑器演练一遍（不发布，结束后删草稿）
     if (opts.dryArticle) {
       const realImages = await downloadImages(imgs);
       const dry = await composeArticle(ctx, { title, paras: built.paras, url: hit.url, images: realImages.slice(0, MAX_IMAGES), boldSet: new Set(art2.bolds || []), dryRun: true });
       return { ok: dry.ok, mode: 'article(dry)', title, url: hit.url, bodyChars: (art2.body || '').length, paras: built.paragraphs, images: realImages.length, boldSet: (art2.bolds || []).length, note: dry.note, publishDialog: dry.publishDialog, cleanup: dry.cleanup, snapshot: dry.snapshot };
     }
-    const lines = [`# 推文串预览 · ${title}`, '', `原文（**不进串**，发送后作自回复发出）：${hit.url}`, '', `正文 ${(art2.body || '').length} 字 → ${built.posts.length} 条（emoji ${built.emoji || '无'}${built.truncated ? '，有截断' : ''}），图片 ${Math.min(imgs.length, MAX_IMAGES)} 张挂首条`, `走哪条路：${mode === 'article' ? 'X Articles（长文，富文本）' : '推文串'}（整串零外链）`, ''];
+    const lines = [`# 推文串预览 · ${title}`, '', `原文（**不进串**，发送后作自回复发出）：${hit.url}`, '', `正文 ${(art2.body || '').length} 字 → ${built.posts.length} 条（emoji ${built.emoji || '无'}${built.truncated ? '，有截断' : ''}），图片 ${Math.min(imgs.length, MAX_IMAGES)} 张挂首条`, `走哪条路：${mode === 'article' ? 'X Articles（长文，富文本）' : mode === 'single' ? `单条长推（≤${SINGLE_POST_MAX} 字，不拆串）` : '推文串'}（零外链）`, ''];
     built.posts.forEach((p, i) => {
       const nImg = i === 0 ? Math.min(imgs.length, MAX_IMAGES) : 0;
       lines.push(`--- 第 ${i + 1} 条（${p.text.length} 字${nImg ? `，${nImg} 张图` : ''}）---`);

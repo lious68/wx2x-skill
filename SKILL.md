@@ -35,6 +35,7 @@ CDP 方式继承真实登录态和浏览器指纹，比自动化浏览器裸奔�
 | `CHROME_PROFILE_DIR` | `Default` | Chrome profile |
 | `X_PROFILE` | — | X 主页 URL，如 `https://x.com/your_handle` |
 | `WX2X_WORKDIR` | 脚本目录 | 状态/日志/图片的工作目录 |
+| `WX2X_SINGLE_MAX` | `4000` | 单条长推的字数上限：`emoji+标题+正文` 不超过它就发一条，超过才拆串 |
 
 ## 命令
 
