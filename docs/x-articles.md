@@ -11,7 +11,7 @@
 | 标题 | `textarea[placeholder="Add a title"]` |
 | 正文 | `div[data-testid="composer"][contenteditable="true"]`（Draft.js）：`keyboard.insertText` + `Enter` 逐段写 |
 | 段落样式 | 按钮**没有 aria-label**，文字就是当前样式（`Body`/`Heading`/`Subheading`），点开后选菜单项 `Heading` |
-| 图片 | `input[data-testid="fileInput"]` —— **插不进正文，见坑 2** |
+| 图片 | 正文插图：`Insert`(`aria-label="Add Media"`) → 菜单项 `Media` → **临时生成的正文媒体 input**（`accept` 含 `video/mp4`、`multiple=true`）→ `setInputFiles`。见坑 1 |
 | 发布 | `button "Publish"` → `publishConfirm()`（见下） |
 | 删草稿/删文章 | `button[aria-label="More"]` → `Delete Article` → 确认按钮 **`Yes, delete`（草稿）或 `Delete Article`（已发布）**，统一按 delete 匹配 |
 | 公开链接 | 编辑页 More 菜单里 "View Article" 的 href，或 `article[data-testid="tweet"]` 里 `a[href*="/status/"]` |
@@ -35,16 +35,27 @@
 
 ## 坑（都踩过，别再踩）
 
-### 1. X 的按钮/菜单项只吃真实鼠标事件
+### 1. 插图要用"临时 input"，别用常驻那个（2026-10-10 跑通）
+
+编辑器里有**两个 file input**，混淆它们就是"图片怎么都插不进正文"的根因：
+
+| input | 特征 | 作用 |
+|---|---|---|
+| 常驻的 | `accept` 只有图片、`multiple=false`、挂在 `Section details` 下 | **封面槽**：往它上传只弹 "Edit media" 改封面，正文里不会出现图 |
+| 临时生成的 | 点 `Insert`(`aria-label="Add Media"`) → 菜单项 `Media` 之后才出现，`accept` 含 `video/mp4`、`multiple=true`、无 `Section details` 祖先 | **正文媒体**：上传即插入光标处 |
+
+要点：
+- **每插一张图都要重走一遍 `Insert → Media`**（input 是临时的，用完就没了）；
+- 菜单项可能点不中（列表重开、结构微调）→ **必须重试**，否则会退回封面槽，表现就是"弹了 Edit media、点 Apply、正文没变"；
+- 图位**跟随光标**：脚本先按 `Ctrl+Home` 回正文开头，图就落在开头几段附近，当视觉头图；
+- 上传成功后判据是正文里 `img` 数增加（`div[data-testid="composer"] img`）。
+
+原文链接不写进正文（零外链原则，由发布后的自回复承载）。
+
+### 2. X 的按钮/菜单项只吃真实鼠标事件
 
 `page.evaluate` 里的 `element.click()` 无效；`locator.click({force:true})` 也可能被吞、被遮罩吃掉（页面常有 `div[data-testid="mask"]`）。
 **最稳方案**：`getBoundingClientRect()` 拿中心点 → `page.mouse.click(x, y)`。
-
-### 2. 图片插不进 Articles 正文
-
-`setInputFiles` 和工具栏 `filechooser` 都会弹 "Edit media"，点 Apply 后正文里依然没有图（Draft.js blocks 不变、`img` 数 0），
-**同一个文件在推文串编辑器里却能正常上传**。
-结论：Articles 只搬文字 + 小标题；图片留给推文串那条路；原文链接也不写进正文（零外链原则，由自回复承载）。
 
 ### 3. Heading 样式会往后串染
 

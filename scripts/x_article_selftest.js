@@ -1,8 +1,58 @@
 'use strict';
-// Final end-to-end self-test of the FIXED X Articles publish channel (mirrors wx2x.js logic):
-// create scratch -> publishConfirm (retry clicks + dialog-optional) -> verify in Published -> delete.
+// End-to-end self-test of the X Articles channel:
+// create scratch -> (optional) insert inline image(s) -> publishConfirm -> verify in Published -> delete.
+// Usage: node x_article_selftest.js [image1.jpg image2.png ...]
+const fs = require('fs');
 const { chromium } = require('playwright');
-const TITLE = 'ZZ 发布通道终检（马上删除）';
+const IMAGES = process.argv.slice(2).filter((f) => fs.existsSync(f));
+const TITLE = 'ZZ 发布通道自检（马上删除）';
+
+async function articleRectClick(page, finderSrc) {
+  const rect = await page.evaluate((src) => {
+    const el = (new Function('return (' + src + ')'))();
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, finderSrc).catch(() => null);
+  if (!rect || !rect.x) return false;
+  await page.mouse.click(rect.x, rect.y).catch(() => {});
+  return true;
+}
+
+// Insert -> Media 临时生成的正文媒体 input（accept 含 video/mp4）；常驻那个是封面槽，别用
+async function openArticleMediaInput(page) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await articleRectClick(page, "Array.from(document.querySelectorAll('button')).find(b => (b.getAttribute('aria-label')||'')==='Add Media' || /^Insert$/i.test((b.innerText||'').trim()))");
+    await page.waitForTimeout(1200);
+    for (let t = 0; t < 3; t++) {
+      await articleRectClick(page, "(() => { const m = Array.from(document.querySelectorAll('[role=\"menuitem\"]')).find(e => (e.innerText||'').trim()==='Media'); if (m) return m; const alt = Array.from(document.querySelectorAll('[role=\"menu\"] div, [role=\"menu\"] span')).filter(e => (e.innerText||'').trim()==='Media'); return alt[0]||null; })()");
+      await page.waitForTimeout(1500);
+      const idx = await page.evaluate(() => Array.from(document.querySelectorAll('input[type="file"]')).findIndex((i) => /video\/mp4/.test(i.getAttribute('accept') || '')));
+      if (idx >= 0) return idx;
+    }
+  }
+  return -1;
+}
+
+async function insertArticleImages(page, files) {
+  const countImgs = () => page.evaluate(() => document.querySelectorAll('div[data-testid="composer"][contenteditable="true"] img').length);
+  await page.keyboard.press('Control+Home').catch(() => {});
+  await page.waitForTimeout(600);
+  let inserted = 0;
+  for (const f of files) {
+    const before = await countImgs();
+    const idx = await openArticleMediaInput(page);
+    if (idx < 0) break;
+    await page.locator('input[type="file"]').nth(idx).setInputFiles(f).catch(() => {});
+    for (let i = 0; i < 12; i++) {
+      await page.waitForTimeout(1500);
+      if ((await countImgs()) > before) { inserted++; break; }
+      const dlgN = await page.locator('[role="dialog"], [role="alertdialog"]').count().catch(() => 0);
+      if (dlgN > 0) await clickDialogConfirm(page, /apply|应用/);
+    }
+  }
+  return inserted;
+}
 
 async function clickDialogConfirm(page, re) {
   const rect = await page.evaluate((src) => {
@@ -83,8 +133,19 @@ async function publishConfirm(page) {
 
   await page.locator('textarea[placeholder="Add a title"]').first().fill(TITLE);
   await page.locator('div[data-testid="composer"][contenteditable="true"]').first().click();
-  await page.keyboard.insertText('终检内容，验证修复后的发布通道，随即删除。');
-  await page.waitForTimeout(2000);
+  for (const p of ['自检内容第一段。', '第二段：验证正文图片插入。']) {
+    await page.keyboard.insertText(p);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+  }
+  await page.waitForTimeout(1500);
+
+  // 可选：正文插图（传了图片路径才跑）
+  if (IMAGES.length) {
+    out.imgsInserted = await insertArticleImages(page, IMAGES);
+    out.imgsA = (out.imgsInserted === IMAGES.length) ? 'ok' : 'WARN expected ' + IMAGES.length;
+    out.steps.push(`inline images: ${out.imgsInserted}/${IMAGES.length} ${out.imgsA}`);
+  }
 
   out.publish = await publishConfirm(page);
 

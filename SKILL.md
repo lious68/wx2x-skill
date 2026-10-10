@@ -63,7 +63,7 @@ node scripts/x_article_selftest.js
 | 文档 | 内容 |
 |---|---|
 | [docs/formatting.md](docs/formatting.md) | 排版规则：推文串拆条、首条、小标题、emoji、去噪、零外链＋自回复 |
-| [docs/x-articles.md](docs/x-articles.md) | X Articles 发布通道：选择器、publishConfirm 语义、5 个坑、自检/删除 |
+| [docs/x-articles.md](docs/x-articles.md) | X Articles 发布通道：选择器、正文插图（两个 file input 的陷阱）、publishConfirm 语义、6 个坑、自检/删除 |
 | [docs/wechat-mp.md](docs/wechat-mp.md) | 公众号后台抓取：两个接口、object-or-string 解析坑、图片下载、掉登录处理 |
 | [docs/ops.md](docs/ops.md) | 去重、限额、节奏、告警文件、锁、定时调度 |
 

@@ -628,6 +628,60 @@ async function retryPublishArticle(ctx, editUrl) {
   }
 }
 
+// ---------- Articles 正文插图（2026-10-10 跑通） ----------
+// 通用：按 DOM 里找到的元素中心点做真实鼠标点击（X 的按钮只吃真实鼠标事件）
+async function articleRectClick(page, finderSrc) {
+  const rect = await page.evaluate((src) => {
+    const el = (new Function('return (' + src + ')'))();
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, finderSrc).catch(() => null);
+  if (!rect || !rect.x) return false;
+  await page.mouse.click(rect.x, rect.y).catch(() => {});
+  return true;
+}
+
+// 打开 Insert → Media，返回**正文媒体 input** 的下标（accept 含 video/mp4 的那个），失败 -1。
+// 踩过的坑：编辑器里常驻的 file input 是封面槽（accept 只有图片、挂 Section details 下），
+// 往它上传只会改封面、正文里不会出现图——所以必须走菜单拿到临时生成的那个 input，且每张图都要重走菜单。
+async function openArticleMediaInput(page) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await articleRectClick(page, "Array.from(document.querySelectorAll('button')).find(b => (b.getAttribute('aria-label')||'')==='Add Media' || /^Insert$/i.test((b.innerText||'').trim()))");
+    await page.waitForTimeout(1200);
+    for (let t = 0; t < 3; t++) {
+      await articleRectClick(page, "(() => { const m = Array.from(document.querySelectorAll('[role=\"menuitem\"]')).find(e => (e.innerText||'').trim()==='Media'); if (m) return m; const alt = Array.from(document.querySelectorAll('[role=\"menu\"] div, [role=\"menu\"] span')).filter(e => (e.innerText||'').trim()==='Media'); return alt[0]||null; })()");
+      await page.waitForTimeout(1500);
+      const idx = await page.evaluate(() => Array.from(document.querySelectorAll('input[type="file"]')).findIndex((i) => /video\/mp4/.test(i.getAttribute('accept') || '')));
+      if (idx >= 0) return idx;
+    }
+  }
+  return -1;
+}
+
+// 往正文插图：图位跟随光标，先 Ctrl+Home 回正文开头，图会落在开头几段附近（当视觉头图）
+async function insertArticleImages(page, files) {
+  if (!files || !files.length) return 0;
+  const countImgs = () => page.evaluate(() => document.querySelectorAll('div[data-testid="composer"][contenteditable="true"] img').length);
+  await page.keyboard.press('Control+Home').catch(() => {});
+  await page.waitForTimeout(600);
+  let inserted = 0;
+  for (const f of files) {
+    const before = await countImgs();
+    const idx = await openArticleMediaInput(page);
+    if (idx < 0) break;
+    await page.locator('input[type="file"]').nth(idx).setInputFiles(f).catch(() => {});
+    for (let i = 0; i < 12; i++) {
+      await page.waitForTimeout(1500);
+      if ((await countImgs()) > before) { inserted++; break; }
+      // 少数情况会弹 Edit media，点 Apply（同样要真实鼠标）
+      const dlgN = await page.locator('[role="dialog"], [role="alertdialog"]').count().catch(() => 0);
+      if (dlgN > 0) await clickDialogConfirm(page, /apply|应用/);
+    }
+  }
+  return inserted;
+}
+
 async function composeArticle(ctx, { title, paras, url, images = [], boldSet = null, dryRun = false }) {
   const page = await ctx.newPage();
   let step = 'boot';
@@ -670,11 +724,11 @@ async function composeArticle(ctx, { title, paras, url, images = [], boldSet = n
     await body.click();
     await page.waitForTimeout(600);
 
-    // 正文里插图片这条路走不通（2026-10-06 实测）：
-    // setInputFiles / 工具栏 filechooser 都会弹出 “Edit media”，点 Apply 后 Draft.js
-    // 正文里仍是原样（blocks 不变、imgs=0），同样的文件在推文串编辑器里却能上传成功。
-    // 所以 Articles 只搬文字 + 小标题，图片留给推文串那条路；
-    // 原文链接也不写进正文，统一由发布后的自回复承载（避免外链降权）。
+    // 正文图片（2026-10-10 跑通）：编辑器里常驻的 file input 是**封面槽**（accept 只有图片、
+    // multiple=false、挂在 "Section details" 下）；往正文插图的 input 是点
+    // Insert(aria-label="Add Media") → Media 之后临时生成的（accept 含 video/mp4），
+    // 每插一张都要重新走一遍菜单（见 openArticleMediaInput）。
+    // 原文链接不写进正文，统一由发布后的自回复承载（避免外链降权）。
     let headings = 0;
     const isHead = (p) => isHeading(p) || (boldSet ? boldSet.has(p.trim()) : false);
     for (const p of paras) {
@@ -689,6 +743,11 @@ async function composeArticle(ctx, { title, paras, url, images = [], boldSet = n
       await page.waitForTimeout(150);
     }
     // 原文链接不写进正文：和推文串一样，链接交给发布后的自回复（避免外链降权）
+    let imgsInserted = 0;
+    if (images.length) {
+      step = 'insert images';
+      imgsInserted = await insertArticleImages(page, images.slice(0, MAX_IMAGES)).catch(() => 0);
+    }
     await page.waitForTimeout(1000);
 
     // 演练：回读编辑器内容后删掉草稿，绝不发布
@@ -748,7 +807,7 @@ async function composeArticle(ctx, { title, paras, url, images = [], boldSet = n
           cleaned = 'failed: ' + e.message.split('\n')[0].slice(0, 60);
         }
       }
-      return { ok: true, dryRun: true, note: `dry run (paras=${paras.length}, headings=${headings}, imgs=${images.length}(未插入), cleanup=${cleaned})`, snapshot: snap, publishDialog: dialogText, cleanup: cleaned };
+      return { ok: true, dryRun: true, note: `dry run (paras=${paras.length}, headings=${headings}, imgs=${imgsInserted} 已插入正文, cleanup=${cleaned})`, snapshot: snap, publishDialog: dialogText, cleanup: cleaned };
     }
 
     step = 'publish';
@@ -757,7 +816,8 @@ async function composeArticle(ctx, { title, paras, url, images = [], boldSet = n
       ok: true,
       editUrl,
       publishedUrl: pubRes.publishedUrl,
-      note: `article submitted (paras=${paras.length}, headings=${headings}, imgs=${images.length} 未插入) publish: ${pubRes.steps.join(' -> ')}`,
+      imgsInserted,
+      note: `article submitted (paras=${paras.length}, headings=${headings}, imgs=${imgsInserted} 已插入正文) publish: ${pubRes.steps.join(' -> ')}`,
     };
   } catch (e) {
     return { ok: false, step, note: 'error@' + step + ': ' + e.message.replace(/\s+/g, ' ').slice(0, 400) };
@@ -956,12 +1016,14 @@ async function postOne(ctx, art, state) {
   const res = mode === 'article'
     ? await composeArticle(ctx, { title, paras: built.paras, url: art.url, images: images.slice(0, MAX_IMAGES), boldSet })
     : await composeThread(ctx, thread);
+  // Articles 的图是插进正文的，计入实际插入数；推文串的图挂在首条
+  const imgsUsed = mode === 'article' ? (res.imgsInserted != null ? res.imgsInserted : 0) : images.length;
   if (!res.ok) {
     if (mode === 'article') {
       fs.writeFileSync(ART_ALERT, `Articles 发布未成功：${title}\n${art.url}\n${new Date().toISOString()}\n${res.note}\n去 x.com/compose/articles 看草稿：要么手动发布，要么删掉草稿，然后删除本文件。\n`, 'utf8');
     }
     log({ action: 'post_result', title, ok: false, note: res.note, mode });
-    return { ...res, title, imgs: images.length, posts: thread.length, mode };
+    return { ...res, title, imgs: imgsUsed, posts: thread.length, mode };
   }
   let verify = mode === 'article' ? await verifyArticle(ctx, title) : await verifyOnProfile(ctx, title);
   // Articles 自愈：没验证到且还留着草稿编辑页 → 再走一次发布（确认弹窗），再验一次
@@ -984,19 +1046,19 @@ async function postOne(ctx, art, state) {
       log({ action: 'link_reply', title, ok: rr.ok, mode, target: linkReplyUrl, note: rr.note || '' });
       if (!rr.ok) console.error('link reply failed:', rr.note);
     }
-    state.posted[key] = { title, url: art.url, ts: Date.now(), kind: 'migrated', mode, imgs: images.length, posts: mode === 'thread' ? thread.length : undefined, tweetUrl, articleUrl: verify.articleUrl, linkReplyUrl };
+    state.posted[key] = { title, url: art.url, ts: Date.now(), kind: 'migrated', mode, imgs: imgsUsed, posts: mode === 'thread' ? thread.length : undefined, tweetUrl, articleUrl: verify.articleUrl, linkReplyUrl };
     const d = localDate();
     state.daily[d] = (state.daily[d] || 0) + 1;
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-    log({ action: 'post_result', title, ok: true, mode, tweetUrl, articleUrl: verify.articleUrl, linkReplyUrl, imgs: images.length, posts: thread.length, retryUsed: verify.retryUsed || false });
-    return { ok: true, title, url: art.url, mode, imgs: images.length, posts: thread.length, tweetUrl, articleUrl: verify.articleUrl, linkReplyUrl, retryUsed: verify.retryUsed || false, note: linkReplyUrl ? 'posted+verified（链接已放自回复）' : 'posted+verified（自回复未成功，见日志）' };
+    log({ action: 'post_result', title, ok: true, mode, tweetUrl, articleUrl: verify.articleUrl, linkReplyUrl, imgs: imgsUsed, posts: thread.length, retryUsed: verify.retryUsed || false });
+    return { ok: true, title, url: art.url, mode, imgs: imgsUsed, posts: thread.length, tweetUrl, articleUrl: verify.articleUrl, linkReplyUrl, retryUsed: verify.retryUsed || false, note: linkReplyUrl ? 'posted+verified（链接已放自回复）' : 'posted+verified（自回复未成功，见日志）' };
   }
   if (mode === 'article') {
     fs.writeFileSync(ART_ALERT, `Articles 发送后没在 Published 里验证到：${title}\n${art.url}\n${new Date().toISOString()}\n${res.note}\n去 x.com/compose/articles 确认状态，处理完删掉本文件。\n`, 'utf8');
   }
   // 点了发送但主页没找到：不记账，等下次 run 的扫描去重兜底
   log({ action: 'post_result', title, ok: false, note: 'submit clicked but not found', mode, toast: res.toast });
-  return { ok: false, title, url: art.url, mode, imgs: images.length, posts: thread.length, note: mode === 'article' ? 'Articles 提交后未验证到，已转人工（见 ' + ART_ALERT + '）' : '发送后主页未验证到，稍后由扫描兜底核对' };
+  return { ok: false, title, url: art.url, mode, imgs: imgsUsed, posts: thread.length, note: mode === 'article' ? 'Articles 提交后未验证到，已转人工（见 ' + ART_ALERT + '）' : '发送后主页未验证到，稍后由扫描兜底核对' };
 }
 
 // ---------- 主流程 ----------
